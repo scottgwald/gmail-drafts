@@ -1,0 +1,13 @@
+{
+  "name": "gmail-drafts",
+  "version": "1.0.0",
+  "description": "Gmail draft lifecycle (reply/compose/list/get/update/delete) over plain REST; runtime-neutral, draft-only by construction",
+  "type": "module",
+  "main": "gmail-drafts.js",
+  "types": "gmail-drafts.d.ts",
+  "exports": { ".": { "types": "./gmail-drafts.d.ts", "default": "./gmail-drafts.js" } },
+  "files": ["gmail-drafts.js", "gmail-drafts.d.ts"],
+  "scripts": { "test": "node test/gmail-drafts.test.mjs" },
+  "repository": "github:scottgwald/gmail-drafts",
+  "license": "MIT"
+}
