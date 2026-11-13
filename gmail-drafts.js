@@ -86,6 +86,55 @@ export function htmlOfText(text) {
   }).join("\n");
 }
 
+// A header value for the wire (RFC 2047): ASCII goes as it is; anything else
+// as UTF-8 "B" encoded-words of at most 75 characters each, split between
+// characters and folded (CRLF + blank), so "Grüße" reads the same in every
+// client instead of arriving as raw bytes a reader has to guess the charset
+// of. A value that already holds encoded-words is decoded first, so a header
+// read back from a draft and written again is not encoded twice.
+export function mimeHeaderEncode(value) {
+  const v = mimeHeaderDecode(String(value == null ? "" : value)).replace(/[\r\n]+/g, " ");
+  if (/^[\x20-\x7e]*$/.test(v)) return v;
+  const te = new TextEncoder();
+  const words = [];
+  let chunk = [];
+  for (const ch of v) {
+    const b = te.encode(ch);
+    if (chunk.length + b.length > 39) { words.push(chunk); chunk = []; } // 39 bytes: a 64-character word, so "Subject: " + word stays within 76
+    chunk.push(...b);
+  }
+  if (chunk.length) words.push(chunk);
+  return words.map((w) => `=?UTF-8?B?${bytesToB64(Uint8Array.from(w))}?=`).join("\r\n ");
+}
+// The reverse: encoded-words ("B" and "Q", any charset the runtime decodes)
+// back to text; blanks between two adjacent encoded-words go, as the RFC
+// says. A word that cannot be decoded stays as it is.
+export function mimeHeaderDecode(value) {
+  const s = String(value == null ? "" : value);
+  if (!s.includes("=?")) return s;
+  const word = /=\?([^?\s]+)\?([bBqQ])\?([^?\s]*)\?=/g;
+  return s.replace(/(\?=)\s+(?==\?[^?\s]+\?[bBqQ]\?)/g, "$1").replace(word, (m, charset, enc, text) => {
+    try {
+      const bytes = /b/i.test(enc) ? b64urlToBytes(text)
+        : Uint8Array.from(text.replace(/_/g, " ").replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))), (c) => c.charCodeAt(0));
+      return new TextDecoder(charset.split("*")[0].toLowerCase(), { fatal: true }).decode(bytes);
+    } catch {
+      return m;
+    }
+  });
+}
+// An attachment's name as MIME parameters: ASCII in a quoted string; else an
+// ASCII stand-in plus the real name as an RFC 2231 extended parameter
+// (name*=UTF-8''percent-encoded), which is what clients read first.
+function mimeNameParam(key, name) {
+  const n = String(name == null ? "" : name).replace(/[\r\n]+/g, " ");
+  const quoted = (t) => `${key}="${t.replace(/[\\"]/g, "\\$&")}"`;
+  if (/^[\x20-\x7e]*$/.test(n)) return quoted(n);
+  const pct = Array.from(new TextEncoder().encode(n), (b) =>
+    ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 45 || b === 46 || b === 95 ? String.fromCharCode(b) : "%" + b.toString(16).toUpperCase().padStart(2, "0"))).join("");
+  return `${quoted(n.replace(/[^\x20-\x7e]/g, "_"))};\r\n ${key}*=UTF-8''${pct}`;
+}
+
 // RFC 2822 message → base64url (RFC 4648 §5, no padding), the `raw` Gmail
 // wants. Headers with an empty value are dropped entirely (an empty `From:`
 // would override the account's send-as). The body goes as
@@ -94,10 +143,12 @@ export function htmlOfText(text) {
 // instead of showing a text/plain-only draft at a fixed width (D3,
 // 2026-11-04); with opts.attachments ([{name, mime, bytes}]) the
 // alternative sits inside a multipart/mixed with the files. UTF-8 is
-// encoded before base64 — btoa on a raw JS string mangles non-ASCII.
+// encoded before base64 — btoa on a raw JS string mangles non-ASCII. A
+// non-ASCII Subject goes as RFC 2047 encoded-words and a non-ASCII file
+// name as an RFC 2231 parameter (mimeHeaderEncode, mimeNameParam).
 export function gmailRawMime(headers, bodyText, opts = {}) {
   const lines = [];
-  for (const [k, v] of headers) if (v) lines.push(`${k}: ${v}`);
+  for (const [k, v] of headers) if (v) lines.push(`${k}: ${/^subject$/i.test(k) ? mimeHeaderEncode(v) : v}`);
   lines.push("MIME-Version: 1.0");
   const alt = boundary("alt");
   const altPart = [
@@ -115,8 +166,8 @@ export function gmailRawMime(headers, bodyText, opts = {}) {
     const mixed = boundary("mixed");
     lines.push(`Content-Type: multipart/mixed; boundary="${mixed}"`, "", `--${mixed}`, ...altPart);
     for (const f of files) {
-      lines.push(`--${mixed}`, `Content-Type: ${f.mime || "application/octet-stream"}; name="${f.name}"`,
-        `Content-Disposition: attachment; filename="${f.name}"`, "Content-Transfer-Encoding: base64", "", bytesToB64(f.bytes));
+      lines.push(`--${mixed}`, `Content-Type: ${f.mime || "application/octet-stream"}; ${mimeNameParam("name", f.name)}`,
+        `Content-Disposition: attachment; ${mimeNameParam("filename", f.name)}`, "Content-Transfer-Encoding: base64", "", bytesToB64(f.bytes));
     }
     lines.push(`--${mixed}--`);
   }
@@ -256,27 +307,33 @@ export function createDraftOps(api) {
   // thread, so alias-run threads keep their alias. opts: cc, bcc (D4 a);
   // quote (default true): the answered message below the body (D4 b) — the
   // caller's cap applies to bodyText alone.
+  // A thread with no incoming message (only your own): the draft follows up
+  // on your last message and goes to the people IT went to — its To, and its
+  // Cc unless opts.cc names one — not to you (own_thread: true in the answer).
   async function reply(threadId, bodyText, opts = {}) {
-    const t = await api(`threads/${enc(threadId)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=Subject&metadataHeaders=Message-ID&metadataHeaders=Date`);
+    const t = await api(`threads/${enc(threadId)}?format=metadata&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Message-ID&metadataHeaders=Date`);
     const msgs = t.messages || [];
     if (!msgs.length) throw new Error("empty thread");
     const sent = (m) => (m.labelIds || []).includes("SENT");
-    const counter = [...msgs].reverse().find((m) => !sent(m)) || msgs[msgs.length - 1];
+    const incoming = [...msgs].reverse().find((m) => !sent(m));
+    const counter = incoming || msgs[msgs.length - 1];
     const lastSent = [...msgs].reverse().find(sent);
     const last = msgs[msgs.length - 1];
-    const to = mailHeader(counter, "Reply-To") || mailHeader(counter, "From");
-    let subject = mailHeader(last, "Subject") || mailHeader(counter, "Subject") || "";
+    const own = !incoming && !!mailHeader(counter, "To");
+    const to = own ? mailHeader(counter, "To") : mailHeader(counter, "Reply-To") || mailHeader(counter, "From");
+    const cc = typeof opts.cc === "string" && opts.cc ? opts.cc : own ? mailHeader(counter, "Cc") : "";
+    let subject = mimeHeaderDecode(mailHeader(last, "Subject") || mailHeader(counter, "Subject") || "");
     if (!/^re:/i.test(subject)) subject = `Re: ${subject}`;
     const msgId = mailHeader(last, "Message-ID");
     const from = lastSent ? mailHeader(lastSent, "From") : "";
     const quote = opts.quote === false ? "" : await quoteOf(counter);
     const raw = gmailRawMime([
-      ["From", from], ["To", to], ["Cc", opts.cc || ""], ["Bcc", opts.bcc || ""], ["Subject", subject],
+      ["From", from], ["To", to], ["Cc", cc], ["Bcc", opts.bcc || ""], ["Subject", subject],
       ["In-Reply-To", msgId], ["References", msgId],
     ], quote ? `${String(bodyText).replace(/\s+$/, "")}\n\n${quote}` : bodyText);
     // threadId is required or the draft is orphaned off-thread.
     const d = await api("drafts", { method: "POST", body: JSON.stringify({ message: { threadId, raw } }) });
-    return { draftId: d.id, to, subject, ...(from ? { from } : {}), ...(opts.cc ? { cc: opts.cc } : {}), ...(opts.bcc ? { bcc: opts.bcc } : {}), quoted: !!quote };
+    return { draftId: d.id, to, subject, ...(from ? { from } : {}), ...(cc ? { cc } : {}), ...(opts.bcc ? { bcc: opts.bcc } : {}), quoted: !!quote, ...(own ? { own_thread: true } : {}) };
   }
 
   async function compose(to, subject, bodyText, opts = {}) {

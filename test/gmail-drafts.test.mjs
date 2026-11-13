@@ -2,7 +2,7 @@
 // REST adapter against a fake fetch. Plain asserts, no framework: runs under
 // `node test/gmail-drafts.test.mjs` and `bun test/gmail-drafts.test.mjs`.
 import assert from "node:assert";
-import { createDraftOps, gmailRestApi, gmailRawMime, mailBodyText, quotedPrintable, htmlOfText, flowedText, mailAttachments } from "../gmail-drafts.js";
+import { createDraftOps, gmailRestApi, gmailRawMime, mailBodyText, quotedPrintable, htmlOfText, flowedText, mailAttachments, mimeHeaderEncode, mimeHeaderDecode } from "../gmail-drafts.js";
 
 const b64url = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
 const b64u = (s) => Buffer.from(s).toString("base64url");
@@ -95,6 +95,45 @@ const ops = createDraftOps(api);
   console.log("reply without alias: pass");
 }
 
+// reply on a thread that holds only your own message (swg-tasks rev8 B3):
+// the draft goes to the people that message went to — its To and its Cc —
+// not back to you; an explicit cc wins over the inherited one
+{
+  const ownCalls = [];
+  const ownApi = async (path, opts = {}) => {
+    ownCalls.push({ path, method: opts.method || "GET", body: opts.body ? JSON.parse(opts.body) : null });
+    if (path.startsWith("threads/")) {
+      return { messages: [
+        { id: "o1", labelIds: ["SENT"], payload: { headers: hdrs({ From: "Scott Greenwald <scottgwald@gmail.com>", To: "Counter Party <cp@x.de>, Second <s@x.de>", Cc: "Third <t@x.de>",
+          Subject: "=?UTF-8?B?R3LDvMOfZQ==?= aus Berlin", "Message-ID": "<own1@x>", Date: "Mon, 2 Nov 2026 10:00:00 +0100" }) } } ] };
+    }
+    if (path === "messages/o1?format=full") {
+      return { id: "o1", payload: { mimeType: "text/plain", body: { data: b64u("My first note") },
+        headers: hdrs({ From: "Scott Greenwald <scottgwald@gmail.com>", Date: "Mon, 2 Nov 2026 10:00:00 +0100" }) } };
+    }
+    return { id: "drOwn", message: { threadId: "tOwn" } };
+  };
+  const own = createDraftOps(ownApi);
+  let r = await own.reply("tOwn", "following up");
+  assert.deepEqual([r.to, r.cc, r.own_thread, r.subject, r.from], ["Counter Party <cp@x.de>, Second <s@x.de>", "Third <t@x.de>", true, "Re: Grüße aus Berlin", "Scott Greenwald <scottgwald@gmail.com>"], JSON.stringify(r));
+  assert(/metadataHeaders=To&metadataHeaders=Cc/.test(ownCalls[0].path), "the thread read asks for To and Cc");
+  let mime = b64url(ownCalls.filter((c) => c.path === "drafts").pop().body.message.raw);
+  assert(mime.includes("To: Counter Party <cp@x.de>, Second <s@x.de>\r\nCc: Third <t@x.de>\r\n"), "To and Cc of the own message: " + mime.slice(0, 240));
+  assert(!/^To: .*scottgwald@gmail\.com/m.test(mime), "not addressed to yourself");
+  assert(mime.includes("Subject: =?UTF-8?B?" + Buffer.from("Re: Grüße aus Berlin").toString("base64") + "?=\r\n"), "the subject, decoded and encoded once: " + mime.slice(0, 300));
+  assert(mime.includes("In-Reply-To: <own1@x>\r\n"), "threads to your own message");
+  assert.equal(partsOf(mime).text, "following up\n\nOn Mon, 2 Nov 2026 10:00:00 +0100, Scott Greenwald <scottgwald@gmail.com> wrote:\n> My first note");
+  r = await own.reply("tOwn", "with another cc", { cc: "Other <o@x.de>", quote: false });
+  assert.deepEqual([r.to, r.cc], ["Counter Party <cp@x.de>, Second <s@x.de>", "Other <o@x.de>"], "an explicit cc wins");
+  mime = b64url(ownCalls.filter((c) => c.path === "drafts").pop().body.message.raw);
+  assert(mime.includes("Cc: Other <o@x.de>\r\n") && !mime.includes("Third"), mime.slice(0, 240));
+  // a thread with an incoming message is answered as before (no own_thread)
+  const r3 = await ops.reply("th3", "as before", { quote: false });
+  assert.deepEqual([r3.to, r3.own_thread, r3.cc], ["Counter Party <cp@x.de>", undefined, undefined]);
+  assert(!ownCalls.some((c) => c.path.includes("send")), "nothing ever sends");
+  console.log("reply on your own thread: pass");
+}
+
 // compose
 {
   const r = await ops.compose("new@x.de", "Hello", "fresh draft");
@@ -169,7 +208,8 @@ console.log("no send path: pass");
 {
   const long = "y".repeat(10000);
   const mime = b64url(gmailRawMime([["From", ""], ["To", "a@x"], ["Subject", "Grüße"]], `ß€ a <b> & c\n\n${long}\n\n> quoted\nhttps://x.de/p?q=1&r=2.`));
-  assert(mime.startsWith('To: a@x\r\nSubject: Grüße\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary="alt-'), mime.slice(0, 160));
+  // (the Subject is an RFC 2047 encoded-word since swg-tasks rev8 B3 — it used to go as raw UTF-8)
+  assert(mime.startsWith('To: a@x\r\nSubject: =?UTF-8?B?R3LDvMOfZQ==?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary="alt-'), mime.slice(0, 160));
   assert(mime.includes('Content-Type: text/plain; charset="UTF-8"; format=flowed; delsp=yes\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n'));
   assert(mime.includes('Content-Type: text/html; charset="UTF-8"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n'));
   assert(mime.split("\r\n").every((l) => l.length <= 76), "every encoded line fits 76 characters");
@@ -185,6 +225,53 @@ console.log("no send path: pass");
   assert.deepEqual(mailAttachments({ parts: [{ mimeType: "application/pdf", filename: "a.pdf", body: { attachmentId: "1", size: 2 } }, { mimeType: "image/png", filename: "l.png", headers: hdrs({ "Content-ID": "<l>" }), body: { attachmentId: "2" } }] }),
     [{ id: "1", name: "a.pdf", mime: "application/pdf", size: 2 }]);
   console.log("mime: pass");
+}
+
+// Headers (swg-tasks rev8 B3): a non-ASCII Subject is RFC 2047 encoded-words
+// — every line within 76 characters, split between characters, decoding
+// back to the text; ASCII is untouched; an already-encoded value is not
+// encoded twice (update re-emits what it read); a non-ASCII file name is an
+// RFC 2231 parameter beside an ASCII stand-in
+{
+  assert.equal(mimeHeaderEncode("Plain subject, no change"), "Plain subject, no change");
+  assert.equal(mimeHeaderEncode("Grüße"), "=?UTF-8?B?R3LDvMOfZQ==?=");
+  assert.equal(mimeHeaderDecode("=?UTF-8?B?R3LDvMOfZQ==?="), "Grüße");
+  assert.equal(mimeHeaderDecode("=?utf-8?Q?Gr=C3=BC=C3=9Fe_aus?= Berlin"), "Grüße aus Berlin", "Q words too");
+  assert.equal(mimeHeaderDecode("=?UTF-8?B?R3LDvA==?=\r\n =?UTF-8?B?w59l?="), "Grüße", "the blank between two words goes");
+  assert.equal(mimeHeaderDecode("=?x-nope?B?AAAA?= stays"), "=?x-nope?B?AAAA?= stays", "an unknown charset is left alone");
+  assert.equal(mimeHeaderEncode("=?UTF-8?B?R3LDvMOfZQ==?="), "=?UTF-8?B?R3LDvMOfZQ==?=", "not encoded twice");
+  const long = "Übergabe — Vertragsentwurf für das Büro in Köln, 日本語のテキスト 🎉 und noch ein langer Schluss";
+  const encd = mimeHeaderEncode(long);
+  assert(encd.split("\r\n ").length > 2 && encd.split("\r\n ").every((w) => /^=\?UTF-8\?B\?[A-Za-z0-9+/=]+\?=$/.test(w) && w.length <= 75), "folded encoded-words of at most 75: " + encd);
+  assert.equal(mimeHeaderDecode(encd), long, "it decodes back, no character split across words");
+  const mime = b64url(gmailRawMime([["To", "a@x"], ["Subject", long]], "x"));
+  assert(mime.split("\r\n").every((l) => l.length <= 76 && /^[\x00-\x7f]*$/.test(l)), "the head is ASCII, every line within 76");
+  assert.equal(mimeHeaderDecode(mime.slice(mime.indexOf("Subject: ") + 9, mime.indexOf("\r\nMIME-Version"))), long);
+  // update: the Subject the draft holds (encoded or not) goes out encoded once
+  const upCalls = [];
+  const upApi = async (path, opts = {}) => {
+    upCalls.push({ path, method: opts.method || "GET", body: opts.body ? JSON.parse(opts.body) : null });
+    if (path === "drafts/dU?format=full") return { id: "dU", message: { id: "mU", threadId: "tU", payload: { mimeType: "text/plain", body: { data: b64u("old") },
+      headers: hdrs({ To: "a@x", Subject: upApi.subject }) } } };
+    return { id: "dU", message: { threadId: "tU" } };
+  };
+  for (const held of ["Re: Grüße", "=?UTF-8?B?" + Buffer.from("Re: Grüße").toString("base64") + "?="]) {
+    upApi.subject = held;
+    await createDraftOps(upApi).update("dU", "new");
+    const m2 = b64url(upCalls.filter((c) => c.method === "PUT").pop().body.message.raw);
+    assert(m2.includes("Subject: =?UTF-8?B?" + Buffer.from("Re: Grüße").toString("base64") + "?=\r\n"), "update re-emits " + held + ": " + m2.slice(0, 120));
+  }
+  await createDraftOps(upApi).update("dU", "new", "", "Ein neuer Betreff: Übersicht");
+  assert.equal(mimeHeaderDecode(/Subject: (.*)\r\n/.exec(b64url(upCalls.filter((c) => c.method === "PUT").pop().body.message.raw))[1]), "Ein neuer Betreff: Übersicht");
+  // file names
+  const att = b64url(gmailRawMime([["To", "a@x"]], "body", { attachments: [
+    { name: "Übersicht 2026.pdf", mime: "application/pdf", bytes: new TextEncoder().encode("hi") },
+    { name: 'a "quoted" name.txt', mime: "text/plain", bytes: new TextEncoder().encode("hi") }] }));
+  assert(att.includes('Content-Type: application/pdf; name="_bersicht 2026.pdf";\r\n name*=UTF-8\'\'%C3%9Cbersicht%202026.pdf\r\n'
+    + 'Content-Disposition: attachment; filename="_bersicht 2026.pdf";\r\n filename*=UTF-8\'\'%C3%9Cbersicht%202026.pdf\r\n'), "an RFC 2231 name beside the ASCII stand-in: " + att.slice(att.indexOf("application/pdf") - 20, att.indexOf("application/pdf") + 260));
+  assert(att.includes('Content-Disposition: attachment; filename="a \\"quoted\\" name.txt"\r\n'), "quotes in an ASCII name are escaped");
+  assert(att.split("\r\n").every((l) => /^[\x00-\x7f]*$/.test(l)), "no raw non-ASCII byte in any header");
+  console.log("headers: subject encoded-words, file names: pass");
 }
 
 // REST adapter: bearer token, 204 empty body tolerated, non-2xx throws

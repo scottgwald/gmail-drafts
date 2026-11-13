@@ -7,7 +7,8 @@ export interface ReplyOpts { cc?: string; bcc?: string; quote?: boolean }
 export interface ComposeOpts { cc?: string; bcc?: string }
 export interface UpdateOpts { cc?: string; bcc?: string }
 
-export interface ReplyResult { draftId: string; to: string; subject: string; from?: string; cc?: string; bcc?: string; quoted: boolean }
+/** own_thread: the thread held no incoming message, so To (and Cc) are those of your own last message. */
+export interface ReplyResult { draftId: string; to: string; subject: string; from?: string; cc?: string; bcc?: string; quoted: boolean; own_thread?: boolean }
 export interface ComposeResult { draftId: string; to: string; subject: string; cc?: string; bcc?: string }
 export interface DraftListItem extends Partial<DraftFields> { draft_id: string; thread_id?: string | null; to?: string; subject?: string }
 export interface DraftListResult { drafts: DraftListItem[]; total: number }
@@ -32,6 +33,10 @@ export function gmailRestApi(
 ): GmailApi;
 /** multipart/alternative (text/plain format=flowed quoted-printable + html); with attachments, inside multipart/mixed. */
 export function gmailRawMime(headers: Array<[string, string]>, bodyText: string, opts?: { attachments?: AttachmentFile[] }): string;
+/** RFC 2047: a non-ASCII header value as folded UTF-8 "B" encoded-words; ASCII unchanged; already-encoded input is not encoded twice. */
+export function mimeHeaderEncode(value: string): string;
+/** RFC 2047 encoded-words back to text. */
+export function mimeHeaderDecode(value: string): string;
 export function quotedPrintable(text: string): string;
 export function flowedText(text: string): string;
 export function htmlOfText(text: string): string;
