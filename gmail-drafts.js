@@ -241,6 +241,24 @@ export function mailAttachments(payload) {
   return out;
 }
 
+// The inline parts of a message — a signature logo, a pasted picture: a
+// Content-ID or an inline disposition on a part that is a file, not the text.
+export function mailInlineCount(payload) {
+  let n = 0;
+  const walk = (p) => {
+    if (!p) return;
+    const hdr = (k) => ((p.headers || []).find((h) => h.name.toLowerCase() === k.toLowerCase()) || {}).value || "";
+    const file = !!p.filename || !!(p.body && p.body.attachmentId) || !/^(text|multipart)\//i.test(p.mimeType || "text/plain");
+    if (file && (/^inline/i.test(hdr("Content-Disposition")) || !!hdr("Content-ID"))) n++;
+    (p.parts || []).forEach(walk);
+  };
+  walk(payload);
+  return n;
+}
+const hasHtmlPart = (p) => !!p && (p.mimeType === "text/html" || (p.parts || []).some(hasHtmlPart));
+// internalDate (ms since the epoch, as a string): when Gmail last saved the draft
+const savedAt = (m) => { const n = Number(m && m.internalDate); return n > 0 ? new Date(n).toISOString() : ""; };
+
 // The draft's own fields beyond from/to/subject (D4 c, 2026-11-04).
 const draftFields = (m) => ({
   cc: mailHeader(m, "Cc"), bcc: mailHeader(m, "Bcc"), reply_to: mailHeader(m, "Reply-To"),
@@ -343,7 +361,9 @@ export function createDraftOps(api) {
   }
 
   // Bare ids from the list call, hydrated (capped) with the draft's headers
-  // and attachments; a failed hydrate still emits the bare id.
+  // and attachments; a failed hydrate still emits the bare id. Each row also
+  // says who it is from (the alias), when it was last saved, how many files
+  // it carries and how its body starts (swg-tasks rev8 B5).
   async function list() {
     const l = await api("drafts?maxResults=15");
     const out = [];
@@ -351,7 +371,11 @@ export function createDraftOps(api) {
       try {
         const full = await api(`drafts/${enc(d.id)}?format=full`);
         const m = full.message || {};
-        out.push({ draft_id: d.id, thread_id: m.threadId || null, to: mailHeader(m, "To"), subject: mailHeader(m, "Subject"), ...draftFields(m) });
+        const f = draftFields(m);
+        const first = (mailBodyText(m.payload).split("\n").find((x) => x.trim()) || "").trim();
+        out.push({ draft_id: d.id, thread_id: m.threadId || null, from: mailHeader(m, "From"), to: mailHeader(m, "To"),
+          subject: mimeHeaderDecode(mailHeader(m, "Subject")), ...f, saved: savedAt(m),
+          attachment_count: f.attachments.length, first_line: first.length > 120 ? first.slice(0, 119) + "…" : first });
       } catch {
         out.push({ draft_id: d.id });
       }
@@ -359,13 +383,26 @@ export function createDraftOps(api) {
     return { drafts: out, total: (l.drafts || []).length };
   }
 
-  async function get(draftId) {
+  // One draft, with everything about it (swg-tasks rev8 B5): both ids (the
+  // Gmail message id and the RFC 822 Message-ID), the threading headers,
+  // when it was last saved, its labels and size, whether it has an html
+  // part, its attachments and the count of inline parts. The body is cut at
+  // 4000 characters and says so (body_truncated, body_chars = the real
+  // length); opts.full returns all of it.
+  async function get(draftId, opts = {}) {
     const d = await api(`drafts/${enc(draftId)}?format=full`);
     const m = d.message || {};
     const body = mailBodyText(m.payload);
-    return { draft_id: d.id, thread_id: m.threadId || null, from: mailHeader(m, "From"),
-      to: mailHeader(m, "To"), subject: mailHeader(m, "Subject"), ...draftFields(m),
-      body: body.slice(0, 4000), body_truncated: body.length > 4000 };
+    const whole = opts.full === true;
+    const f = draftFields(m);
+    return { draft_id: d.id, thread_id: m.threadId || null, message_id: m.id || null, from: mailHeader(m, "From"),
+      to: mailHeader(m, "To"), subject: mimeHeaderDecode(mailHeader(m, "Subject")),
+      cc: f.cc, bcc: f.bcc, reply_to: f.reply_to, date: f.date, saved: savedAt(m),
+      rfc_message_id: mailHeader(m, "Message-ID"), in_reply_to: f.in_reply_to, references: mailHeader(m, "References"),
+      labels: m.labelIds || [], size: m.sizeEstimate || 0, has_html: hasHtmlPart(m.payload),
+      attachments: f.attachments, inline_count: mailInlineCount(m.payload),
+      body: whole ? body : body.slice(0, 4000), body_chars: body.length, body_truncated: !whole && body.length > 4000,
+      ...(whole ? { full: true } : {}) };
   }
 
   // Replace a draft's body (and optionally To/Subject, opts.cc/opts.bcc)

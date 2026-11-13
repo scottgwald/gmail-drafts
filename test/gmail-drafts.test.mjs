@@ -2,7 +2,7 @@
 // REST adapter against a fake fetch. Plain asserts, no framework: runs under
 // `node test/gmail-drafts.test.mjs` and `bun test/gmail-drafts.test.mjs`.
 import assert from "node:assert";
-import { createDraftOps, gmailRestApi, gmailRawMime, mailBodyText, quotedPrintable, htmlOfText, flowedText, mailAttachments, mimeHeaderEncode, mimeHeaderDecode } from "../gmail-drafts.js";
+import { createDraftOps, gmailRestApi, gmailRawMime, mailBodyText, quotedPrintable, htmlOfText, flowedText, mailAttachments, mailInlineCount, mimeHeaderEncode, mimeHeaderDecode } from "../gmail-drafts.js";
 
 const b64url = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
 const b64u = (s) => Buffer.from(s).toString("base64url");
@@ -34,9 +34,9 @@ const api = async (path, opts = {}) => {
   if (path === "drafts?maxResults=15") return { drafts: [{ id: "drX" }, { id: "drBroken" }] };
   if (path === "drafts/drBroken?format=full") throw new Error("gmail drafts/drBroken 404");
   if (path === "drafts/drX?format=full") {
-    return { id: "drX", message: { id: "mX", threadId: "th3", payload: {
+    return { id: "drX", message: { id: "mX", threadId: "th3", labelIds: ["DRAFT"], internalDate: "1793692800000", sizeEstimate: 2345, payload: {
       headers: hdrs({ From: "Scott Greenwald <scottgwald@gmail.com>", To: "Counter Party <cp@x.de>", Cc: "Third <t@x.de>", Bcc: "Me <me@x.de>",
-        "Reply-To": "replies@x.de", Subject: "Re: Hello", Date: "Tue, 3 Nov 2026 09:00:00 +0100", "In-Reply-To": "<mid9@x>", References: "<mid9@x>" }),
+        "Reply-To": "replies@x.de", Subject: "Re: Hello", Date: "Tue, 3 Nov 2026 09:00:00 +0100", "Message-ID": "<draft1@mail.gmail.com>", "In-Reply-To": "<mid9@x>", References: "<mid1@x> <mid9@x>" }),
       mimeType: "multipart/mixed",
       parts: [
         { mimeType: "text/html", body: { data: b64u("<p>Hi &amp; bye</p>") } },
@@ -153,9 +153,11 @@ const ops = createDraftOps(api);
 {
   const r = await ops.list();
   assert.equal(r.total, 2);
-  assert.deepEqual(r.drafts[0], { draft_id: "drX", thread_id: "th3", to: "Counter Party <cp@x.de>", subject: "Re: Hello",
+  // (rev8 B5: from, saved, attachment_count and first_line joined the row)
+  assert.deepEqual(r.drafts[0], { draft_id: "drX", thread_id: "th3", from: "Scott Greenwald <scottgwald@gmail.com>", to: "Counter Party <cp@x.de>", subject: "Re: Hello",
     cc: "Third <t@x.de>", bcc: "Me <me@x.de>", reply_to: "replies@x.de", date: "Tue, 3 Nov 2026 09:00:00 +0100", in_reply_to: "<mid9@x>",
-    attachments: [{ id: "attK", name: "keep.pdf", mime: "application/pdf", size: 7 }] });
+    attachments: [{ id: "attK", name: "keep.pdf", mime: "application/pdf", size: 7 }],
+    saved: "2026-11-03T08:00:00.000Z", attachment_count: 1, first_line: "Hi & bye" });
   assert.deepEqual(r.drafts[1], { draft_id: "drBroken" });
   console.log("list: pass");
 }
@@ -167,6 +169,27 @@ const ops = createDraftOps(api);
   assert.equal(r.body, "Hi & bye");
   assert.deepEqual([r.cc, r.bcc, r.reply_to, r.date, r.in_reply_to, r.body_truncated], ["Third <t@x.de>", "Me <me@x.de>", "replies@x.de", "Tue, 3 Nov 2026 09:00:00 +0100", "<mid9@x>", false]);
   assert.deepEqual(r.attachments, [{ id: "attK", name: "keep.pdf", mime: "application/pdf", size: 7 }]);
+  // rev8 B5: everything about the draft, in one answer
+  assert.deepEqual(r, { draft_id: "drX", thread_id: "th3", message_id: "mX", from: "Scott Greenwald <scottgwald@gmail.com>",
+    to: "Counter Party <cp@x.de>", subject: "Re: Hello", cc: "Third <t@x.de>", bcc: "Me <me@x.de>", reply_to: "replies@x.de",
+    date: "Tue, 3 Nov 2026 09:00:00 +0100", saved: "2026-11-03T08:00:00.000Z",
+    rfc_message_id: "<draft1@mail.gmail.com>", in_reply_to: "<mid9@x>", references: "<mid1@x> <mid9@x>",
+    labels: ["DRAFT"], size: 2345, has_html: true,
+    attachments: [{ id: "attK", name: "keep.pdf", mime: "application/pdf", size: 7 }], inline_count: 1,
+    body: "Hi & bye", body_chars: 8, body_truncated: false }, JSON.stringify(r));
+  // a long body is cut at 4000 and says so; full returns all of it; a bare draft has quiet defaults
+  const longApi = async (path) => ({ id: "drL", message: { id: "mL", payload: { mimeType: "text/plain", body: { data: b64u("z".repeat(5000)) },
+    headers: hdrs({ To: "a@x", Subject: "=?UTF-8?B?R3LDvMOfZQ==?=" }) } } });
+  const cut = await createDraftOps(longApi).get("drL");
+  assert.deepEqual([cut.body.length, cut.body_chars, cut.body_truncated, cut.full], [4000, 5000, true, undefined]);
+  const whole = await createDraftOps(longApi).get("drL", { full: true });
+  assert.deepEqual([whole.body.length, whole.body_chars, whole.body_truncated, whole.full], [5000, 5000, false, true]);
+  assert.deepEqual([cut.subject, cut.thread_id, cut.saved, cut.rfc_message_id, cut.references, cut.labels, cut.size, cut.has_html, cut.inline_count, cut.attachments],
+    ["Grüße", null, "", "", "", [], 0, false, 0, []], "a draft with nothing else: " + JSON.stringify({ ...cut, body: "" }));
+  assert.equal(mailInlineCount({ parts: [{ mimeType: "text/plain", headers: hdrs({ "Content-Disposition": "inline" }), body: { data: "eA" } },
+    { mimeType: "image/png", filename: "l.png", headers: hdrs({ "Content-ID": "<l>" }), body: { attachmentId: "2" } },
+    { mimeType: "image/gif", headers: hdrs({ "Content-Disposition": "inline" }), body: { data: "eA" } },
+    { mimeType: "application/pdf", filename: "a.pdf", headers: hdrs({ "Content-Disposition": "attachment" }), body: { attachmentId: "1" } }] }), 2, "the text itself and a real attachment are not inline parts");
   console.log("get: pass");
 }
 

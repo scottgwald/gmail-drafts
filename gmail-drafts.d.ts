@@ -10,16 +10,23 @@ export interface UpdateOpts { cc?: string; bcc?: string }
 /** own_thread: the thread held no incoming message, so To (and Cc) are those of your own last message. */
 export interface ReplyResult { draftId: string; to: string; subject: string; from?: string; cc?: string; bcc?: string; quoted: boolean; own_thread?: boolean }
 export interface ComposeResult { draftId: string; to: string; subject: string; cc?: string; bcc?: string }
-export interface DraftListItem extends Partial<DraftFields> { draft_id: string; thread_id?: string | null; to?: string; subject?: string }
+/** saved: ISO time Gmail last saved the draft ("" when unknown); first_line: the body's first non-empty line, 120 characters at most. */
+export interface DraftListItem extends Partial<DraftFields> { draft_id: string; thread_id?: string | null; from?: string; to?: string; subject?: string; saved?: string; attachment_count?: number; first_line?: string }
 export interface DraftListResult { drafts: DraftListItem[]; total: number }
-export interface DraftGetResult extends DraftFields { draft_id: string; thread_id: string | null; from: string; to: string; subject: string; body: string; body_truncated: boolean }
+export interface GetOpts { /** the whole body instead of the first 4000 characters */ full?: boolean }
+/** message_id: the Gmail message id; rfc_message_id: the RFC 822 Message-ID header; size: Gmail's sizeEstimate of the raw message; body_chars: the body's real length. */
+export interface DraftGetResult extends DraftFields {
+  draft_id: string; thread_id: string | null; message_id: string | null; from: string; to: string; subject: string;
+  saved: string; rfc_message_id: string; references: string; labels: string[]; size: number; has_html: boolean; inline_count: number;
+  body: string; body_chars: number; body_truncated: boolean; full?: true;
+}
 export interface UpdateResult { draftId: string; threadId: string | null }
 
 export interface DraftOps {
   reply(threadId: string, bodyText: string, opts?: ReplyOpts): Promise<ReplyResult>;
   compose(to: string, subject: string, bodyText: string, opts?: ComposeOpts): Promise<ComposeResult>;
   list(): Promise<DraftListResult>;
-  get(draftId: string): Promise<DraftGetResult>;
+  get(draftId: string, opts?: GetOpts): Promise<DraftGetResult>;
   update(draftId: string, bodyText: string, to?: string, subject?: string, opts?: UpdateOpts): Promise<UpdateResult>;
   delete(draftId: string): Promise<void>;
   /** The bytes of a message's attachments, as files for gmailRawMime. */
@@ -45,3 +52,5 @@ export function mailPartText(payload: any, want: string): string;
 export function mailHtmlToText(html: string): string;
 export function mailBodyText(payload: any): string;
 export function mailAttachments(payload: any): MailAttachment[];
+/** Parts with a Content-ID or an inline disposition that are files (a logo, a pasted picture). */
+export function mailInlineCount(payload: any): number;
