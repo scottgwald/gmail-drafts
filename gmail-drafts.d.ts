@@ -44,6 +44,10 @@ export function gmailRawMime(headers: Array<[string, string]>, bodyText: string,
 export function mimeHeaderEncode(value: string): string;
 /** RFC 2047 encoded-words back to text. */
 export function mimeHeaderDecode(value: string): string;
+/** An address header (To, Cc, Bcc, From, Reply-To) for the wire: a non-ASCII display name as encoded-words, the <addr> never; an all-ASCII header unchanged. */
+export function mimeAddressEncode(value: string): string;
+/** An address header for display: encoded display names back to text, quoted again when they need it. */
+export function mimeAddressDecode(value: string): string;
 export function quotedPrintable(text: string): string;
 export function flowedText(text: string): string;
 export function htmlOfText(text: string): string;

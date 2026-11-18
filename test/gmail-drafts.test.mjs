@@ -2,7 +2,7 @@
 // REST adapter against a fake fetch. Plain asserts, no framework: runs under
 // `node test/gmail-drafts.test.mjs` and `bun test/gmail-drafts.test.mjs`.
 import assert from "node:assert";
-import { createDraftOps, gmailRestApi, gmailRawMime, mailBodyText, quotedPrintable, htmlOfText, flowedText, mailAttachments, mailInlineCount, mimeHeaderEncode, mimeHeaderDecode } from "../gmail-drafts.js";
+import { createDraftOps, gmailRestApi, gmailRawMime, mailBodyText, quotedPrintable, htmlOfText, flowedText, mailAttachments, mailInlineCount, mimeHeaderEncode, mimeHeaderDecode, mimeAddressEncode, mimeAddressDecode } from "../gmail-drafts.js";
 
 const b64url = (s) => Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
 const b64u = (s) => Buffer.from(s).toString("base64url");
@@ -295,6 +295,70 @@ console.log("no send path: pass");
   assert(att.includes('Content-Disposition: attachment; filename="a \\"quoted\\" name.txt"\r\n'), "quotes in an ASCII name are escaped");
   assert(att.split("\r\n").every((l) => /^[\x00-\x7f]*$/.test(l)), "no raw non-ASCII byte in any header");
   console.log("headers: subject encoded-words, file names: pass");
+}
+
+// Address headers (swg-tasks rev9 B2): in To / Cc / Bcc / From / Reply-To a
+// non-ASCII display name is RFC 2047 encoded-words, mailbox by mailbox — the
+// <addr> never, an ASCII mailbox byte for byte, a quoted name with a comma
+// one mailbox; what a draft holds encoded goes out again as it is; list and
+// get show the names decoded
+{
+  const ew = (t) => "=?UTF-8?B?" + Buffer.from(t).toString("base64") + "?=";
+  // ASCII: byte for byte, whatever it holds
+  for (const plain of ["Counter Party <cp@x.de>", "a@x", "a@x, b@y", '"Party, Counter" <cp@x.de>,  Second <s@x.de>', "", ew("Jörg") + " <j@x.de>"]) {
+    assert.equal(mimeAddressEncode(plain), plain, "unchanged: " + plain);
+  }
+  // the spec's case: the quoted non-ASCII name is encoded without its quotes, the ASCII mailbox is untouched
+  assert.equal(mimeAddressEncode('"Jörg Müller" <j@x.de>, Ana <a@x.de>'), ew("Jörg Müller") + " <j@x.de>, Ana <a@x.de>");
+  assert.equal(mimeAddressEncode("Jörg Müller <j@x.de>"), ew("Jörg Müller") + " <j@x.de>", "an unquoted name");
+  assert.equal(mimeAddressEncode('Ana <a@x.de>, "Müller, Jörg" <j@x.de>,Zoë<z@x.de>'), "Ana <a@x.de>, " + ew("Müller, Jörg") + " <j@x.de>," + ew("Zoë") + " <z@x.de>", "a comma inside quotes does not split; a missing blank before < is added");
+  assert.equal(mimeAddressEncode('"Jörg \\"the\\" Müller" <j@x.de>'), ew('Jörg "the" Müller') + " <j@x.de>", "escaped quotes inside the name");
+  assert.equal(mimeAddressEncode("jörg@x.de, Ana <a@x.de>"), "jörg@x.de, Ana <a@x.de>", "a bare address is never encoded");
+  assert.equal(mimeAddressEncode("Ana <ana@köln.example>"), "Ana <ana@köln.example>", "nor is the address in angle brackets");
+  assert.equal(mimeAddressEncode("Jörg <j@köln.example>"), ew("Jörg") + " <j@köln.example>", "the name is, the address beside it is not");
+  assert.equal(mimeAddressEncode(ew("Jörg") + " Müller <j@x.de>"), ew("Jörg Müller") + " <j@x.de>", "a half-encoded name is decoded first, encoded once");
+  const longName = "Übergabe — Vertragsentwurf für das Büro in Köln, 日本語のテキスト und noch ein langer Schluss";
+  const longEnc = mimeAddressEncode(`"${longName}" <l@x.de>`);
+  assert(longEnc.endsWith("?= <l@x.de>") && longEnc.split("\r\n ").length > 2 && longEnc.split("\r\n ").every((w) => /^[\x21-\x7e ]+$/.test(w) && w.length <= 76), "a long name folds between encoded-words: " + longEnc);
+  assert.equal(mimeHeaderDecode(longEnc.slice(0, longEnc.lastIndexOf(" <"))), longName);
+  // back for display
+  assert.equal(mimeAddressDecode(ew("Jörg Müller") + " <j@x.de>, Ana <a@x.de>"), "Jörg Müller <j@x.de>, Ana <a@x.de>");
+  assert.equal(mimeAddressDecode(ew("Müller, Jörg") + " <j@x.de>"), '"Müller, Jörg" <j@x.de>', "a decoded name with a comma is quoted again");
+  assert.equal(mimeAddressDecode('"' + ew("Jörg") + '" <j@x.de>'), "Jörg <j@x.de>", "an encoded-word some senders put in quotes");
+  assert.equal(mimeAddressDecode('"Party, Counter" <cp@x.de>'), '"Party, Counter" <cp@x.de>', "nothing encoded: as it is");
+  for (const v of ['"Jörg Müller" <j@x.de>, Ana <a@x.de>', '"Müller, Jörg" <j@x.de>', "Zoë <z@x.de>, b@y"]) {
+    assert.equal(mimeAddressEncode(mimeAddressDecode(mimeAddressEncode(v))), mimeAddressEncode(v), "shown, handed back, the same on the wire: " + v);
+  }
+  // the message: every address header, and only those
+  const mime = b64url(gmailRawMime([["From", "Jörg Müller <me@x.de>"], ["To", '"Jörg Müller" <j@x.de>, Ana <a@x.de>'], ["Cc", "Zoë <z@x.de>"], ["Bcc", "René <r@x.de>"],
+    ["Reply-To", "Büro <b@x.de>"], ["Subject", "plain"], ["References", "<id@x>"]], "x"));
+  assert(mime.startsWith(`From: ${ew("Jörg Müller")} <me@x.de>\r\nTo: ${ew("Jörg Müller")} <j@x.de>, Ana <a@x.de>\r\nCc: ${ew("Zoë")} <z@x.de>\r\nBcc: ${ew("René")} <r@x.de>\r\nReply-To: ${ew("Büro")} <b@x.de>\r\nSubject: plain\r\nReferences: <id@x>\r\nMIME-Version: 1.0\r\n`), mime.slice(0, 400));
+  assert(mime.slice(0, mime.indexOf("MIME-Version")).split("\r\n").every((l) => /^[\x00-\x7f]*$/.test(l)), "no raw non-ASCII byte in the head");
+  assert(b64url(gmailRawMime([["To", "Counter Party <cp@x.de>"], ["Subject", "s"]], "x")).startsWith("To: Counter Party <cp@x.de>\r\nSubject: s\r\n"), "an ASCII To is the bytes it always was");
+  // the ops: compose encodes; update re-emits what the draft holds, encoded once; list and get show the names
+  const adCalls = [];
+  const held = { From: ew("Jörg Müller") + " <me@x.de>", To: ew("Müller, Jörg") + " <j@x.de>, Ana <a@x.de>", Cc: ew("Zoë") + " <z@x.de>", Subject: "s" };
+  const adApi = async (path, opts = {}) => {
+    adCalls.push({ path, method: opts.method || "GET", body: opts.body ? JSON.parse(opts.body) : null });
+    if (path === "drafts/dA?format=full") return { id: "dA", message: { id: "mA", threadId: "tA", payload: { mimeType: "text/plain", body: { data: b64u("old") }, headers: hdrs(held) } } };
+    if (path.startsWith("drafts?")) return { drafts: [{ id: "dA" }] };
+    return { id: "dA", message: { threadId: "tA" } };
+  };
+  const adOps = createDraftOps(adApi);
+  const cr = await adOps.compose('"Jörg Müller" <j@x.de>, Ana <a@x.de>', "Hallo", "x", { cc: "Zoë <z@x.de>" });
+  assert.equal(cr.to, '"Jörg Müller" <j@x.de>, Ana <a@x.de>', "the answer names the recipients as they were given");
+  assert(b64url(adCalls.filter((c) => c.method === "POST").pop().body.message.raw).startsWith(`To: ${ew("Jörg Müller")} <j@x.de>, Ana <a@x.de>\r\nCc: ${ew("Zoë")} <z@x.de>\r\nSubject: Hallo\r\n`), "compose encodes the names");
+  await adOps.update("dA", "new");
+  const upRaw = b64url(adCalls.filter((c) => c.method === "PUT").pop().body.message.raw);
+  assert(upRaw.startsWith(`From: ${held.From}\r\nTo: ${held.To}\r\nCc: ${held.Cc}\r\nSubject: s\r\n`), "update re-emits the held headers, not encoded twice: " + upRaw.slice(0, 300));
+  const got = await adOps.get("dA");
+  assert.deepEqual([got.from, got.to, got.cc], ["Jörg Müller <me@x.de>", '"Müller, Jörg" <j@x.de>, Ana <a@x.de>', "Zoë <z@x.de>"], "get shows the names: " + JSON.stringify([got.from, got.to, got.cc]));
+  const li = (await adOps.list()).drafts[0];
+  assert.deepEqual([li.from, li.to, li.cc], [got.from, got.to, got.cc], "list too");
+  await adOps.update("dA", "new", got.to);
+  assert(b64url(adCalls.filter((c) => c.method === "PUT").pop().body.message.raw).includes(`\r\nTo: ${held.To}\r\n`), "the shown To handed back is the same header again");
+  assert(!adCalls.some((c) => /send/i.test(c.path)), "nothing sends");
+  console.log("headers: address display names encoded, addresses never: pass");
 }
 
 // REST adapter: bearer token, 204 empty body tolerated, non-2xx throws

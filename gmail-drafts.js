@@ -123,6 +123,67 @@ export function mimeHeaderDecode(value) {
     }
   });
 }
+// An address header (To, Cc, Bcc, From, Reply-To) cut into its mailboxes at
+// the commas that stand outside a quoted string, an <angle address> and a
+// (comment), so "Müller, Jörg" <j@x.de> is one mailbox.
+function splitMailboxes(v) {
+  const out = [];
+  let cur = "", quoted = false, angle = 0, paren = 0;
+  for (let i = 0; i < v.length; i++) {
+    const ch = v[i];
+    if (quoted) {
+      cur += ch;
+      if (ch === "\\" && i + 1 < v.length) cur += v[++i];
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"' && !paren) quoted = true;
+    else if (ch === "(") paren++;
+    else if (ch === ")" && paren) paren--;
+    else if (ch === "<" && !paren) angle++;
+    else if (ch === ">" && angle && !paren) angle--;
+    else if (ch === "," && !angle && !paren) { out.push(cur); cur = ""; continue; }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+// One mailbox as [blanks before, display-name phrase, " <addr>" with its
+// blanks], or null when it does not end in an <angle address>.
+const mailboxParts = (piece) => piece.match(/^(\s*)([\s\S]*?)(\s*<[^<>]*>\s*)$/);
+// A display-name phrase without its quotes: "a \"b\" c" → a "b" c.
+const unquotePhrase = (p) => p.trim().replace(/"((?:[^"\\]|\\.)*)"/g, (m, inner) => inner.replace(/\\(.)/g, "$1"));
+// An address header for the wire (swg-tasks rev9 B2): in each mailbox only
+// the display name is encoded, as RFC 2047 encoded-words, and only when it
+// is not ASCII — never the <addr>, and an encoded-word never stands inside
+// quotes, so the name loses them. A header that is all ASCII goes out byte
+// for byte as it came (an already encoded one among them, so nothing is
+// encoded twice); so does an ASCII mailbox beside a non-ASCII one, and a
+// bare address without a name.
+export function mimeAddressEncode(value) {
+  const raw = String(value == null ? "" : value);
+  if (/^[\x00-\x7f]*$/.test(raw)) return raw;
+  return splitMailboxes(raw.replace(/[\r\n]+/g, " ")).map((piece) => {
+    const m = mailboxParts(piece);
+    if (!m || /^[\x00-\x7f]*$/.test(m[2])) return piece;
+    return m[1] + mimeHeaderEncode(unquotePhrase(m[2])) + (/^\s/.test(m[3]) ? m[3] : " " + m[3]);
+  }).join(",");
+}
+// The reverse, for showing a draft's address headers: an encoded display
+// name back to text — in quotes again when it holds a character that would
+// change the header's meaning (a comma, a quote, a bracket …), so what is
+// shown can be handed back as a recipient. Everything else as it is.
+export function mimeAddressDecode(value) {
+  const s = String(value == null ? "" : value);
+  if (!s.includes("=?")) return s;
+  return splitMailboxes(s).map((piece) => {
+    const m = mailboxParts(piece);
+    if (!m || !m[2].includes("=?")) return piece;
+    const name = mimeHeaderDecode(unquotePhrase(m[2]));
+    if (name === m[2].trim()) return piece;
+    return m[1] + (/[()<>[\]:;@\\,."]/.test(name) ? `"${name.replace(/[\\"]/g, "\\$&")}"` : name) + m[3];
+  }).join(",");
+}
 // An attachment's name as MIME parameters: ASCII in a quoted string; else an
 // ASCII stand-in plus the real name as an RFC 2231 extended parameter
 // (name*=UTF-8''percent-encoded), which is what clients read first.
@@ -145,10 +206,13 @@ function mimeNameParam(key, name) {
 // alternative sits inside a multipart/mixed with the files. UTF-8 is
 // encoded before base64 — btoa on a raw JS string mangles non-ASCII. A
 // non-ASCII Subject goes as RFC 2047 encoded-words and a non-ASCII file
-// name as an RFC 2231 parameter (mimeHeaderEncode, mimeNameParam).
+// name as an RFC 2231 parameter (mimeHeaderEncode, mimeNameParam); in an
+// address header a non-ASCII display name is encoded, the address never
+// (mimeAddressEncode).
+const ADDRESS_HEADER_RE = /^(from|to|cc|bcc|reply-to|sender)$/i;
 export function gmailRawMime(headers, bodyText, opts = {}) {
   const lines = [];
-  for (const [k, v] of headers) if (v) lines.push(`${k}: ${/^subject$/i.test(k) ? mimeHeaderEncode(v) : v}`);
+  for (const [k, v] of headers) if (v) lines.push(`${k}: ${/^subject$/i.test(k) ? mimeHeaderEncode(v) : ADDRESS_HEADER_RE.test(k) ? mimeAddressEncode(v) : v}`);
   lines.push("MIME-Version: 1.0");
   const alt = boundary("alt");
   const altPart = [
@@ -261,7 +325,7 @@ const savedAt = (m) => { const n = Number(m && m.internalDate); return n > 0 ? n
 
 // The draft's own fields beyond from/to/subject (D4 c, 2026-11-04).
 const draftFields = (m) => ({
-  cc: mailHeader(m, "Cc"), bcc: mailHeader(m, "Bcc"), reply_to: mailHeader(m, "Reply-To"),
+  cc: mimeAddressDecode(mailHeader(m, "Cc")), bcc: mimeAddressDecode(mailHeader(m, "Bcc")), reply_to: mimeAddressDecode(mailHeader(m, "Reply-To")),
   date: mailHeader(m, "Date"), in_reply_to: mailHeader(m, "In-Reply-To"),
   attachments: mailAttachments(m.payload),
 });
@@ -373,7 +437,7 @@ export function createDraftOps(api) {
         const m = full.message || {};
         const f = draftFields(m);
         const first = (mailBodyText(m.payload).split("\n").find((x) => x.trim()) || "").trim();
-        out.push({ draft_id: d.id, thread_id: m.threadId || null, from: mailHeader(m, "From"), to: mailHeader(m, "To"),
+        out.push({ draft_id: d.id, thread_id: m.threadId || null, from: mimeAddressDecode(mailHeader(m, "From")), to: mimeAddressDecode(mailHeader(m, "To")),
           subject: mimeHeaderDecode(mailHeader(m, "Subject")), ...f, saved: savedAt(m),
           attachment_count: f.attachments.length, first_line: first.length > 120 ? first.slice(0, 119) + "…" : first });
       } catch {
@@ -395,8 +459,8 @@ export function createDraftOps(api) {
     const body = mailBodyText(m.payload);
     const whole = opts.full === true;
     const f = draftFields(m);
-    return { draft_id: d.id, thread_id: m.threadId || null, message_id: m.id || null, from: mailHeader(m, "From"),
-      to: mailHeader(m, "To"), subject: mimeHeaderDecode(mailHeader(m, "Subject")),
+    return { draft_id: d.id, thread_id: m.threadId || null, message_id: m.id || null, from: mimeAddressDecode(mailHeader(m, "From")),
+      to: mimeAddressDecode(mailHeader(m, "To")), subject: mimeHeaderDecode(mailHeader(m, "Subject")),
       cc: f.cc, bcc: f.bcc, reply_to: f.reply_to, date: f.date, saved: savedAt(m),
       rfc_message_id: mailHeader(m, "Message-ID"), in_reply_to: f.in_reply_to, references: mailHeader(m, "References"),
       labels: m.labelIds || [], size: m.sizeEstimate || 0, has_html: hasHtmlPart(m.payload),
